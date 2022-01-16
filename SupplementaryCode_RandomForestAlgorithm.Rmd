@@ -1,0 +1,171 @@
+---
+title: "Implementing RF algorithm to generate expected MEU predictions"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+
+data <- read.csv("/Users/conradsafranek/Desktop/2020-5-23-surf2020data-deidentified.csv")
+
+clean_data_w_remifentanil <- data %>%
+  mutate(
+    total_intraop_MEUperkg = total_intraop_narcotics_meu / weight_kg,
+    total_PACU_MEUperkg = total_pacu_narcotics_meu / weight_kg,
+    total_overall_MEUperkg = total_intraop_MEUperkg + total_PACU_MEUperkg,
+  ) %>%
+  unique()
+    
+
+```
+
+```{r REDUCE number of group_names to 53 for Random Forest}
+## Random forest requires 53 groupings maximum, so it's necessary to cut back the number of categories for categorical variables with more than 53 distinct categories --> 52 categories + "other" 
+
+## Reduce groupings to n = 52 + Other
+#figure out how many procedures per group to determine 52nd highest by number as cutoff
+group_nums <- group_by(top_procedure_groupings, group_name) %>%
+  summarize(n_procedures_in_group = sum(n_procedures)) %>%
+  arrange(-n_procedures_in_group)
+
+#set cutoff value at 52nd row
+n_cutoff_group <- group_nums$n_procedures_in_group[52]
+
+clean_data_w_groupings$group_name <- as.character(clean_data_w_groupings$group_name)
+
+clean_data_w_groupings <- clean_data_w_groupings%>%
+  full_join(group_nums, by = "group_name") %>%
+  mutate(group_name_reduced = ifelse(n_procedures_in_group>=n_cutoff_group, group_name, "Other")) %>%
+  mutate(group_name_reduced = ifelse(is.na(group_name_reduced), "Other", as.character(group_name_reduced))) %>%
+  select(-n_procedures_in_group)
+
+## Reduce anesthesiologists to n = 52 + Other
+#figure out how many procedures per provider to determine 52nd highest by number as cutoff
+anesth_case_count <- group_by(clean_data, anesprovfirst) %>%
+  summarize(n_procedures_per_prov = n()) %>%
+  arrange(-n_procedures_per_prov) 
+
+#set cutoff value at 52nd row (= 133)
+n_cutoff_prov <- anesth_case_count$n_procedures_per_prov[52]
+
+#number 52 is provider 50 w/ 133, use this as cut off for groupings
+clean_data_w_groupings <- clean_data_w_groupings %>%
+  inner_join(anesth_case_count, by = "anesprovfirst") %>%
+  mutate(anesthesiologist_reduced = ifelse(n_procedures_per_prov>=n_cutoff_prov, as.character(anesprovfirst), "Other")) %>%
+  select(-n_procedures_per_prov)
+
+## Reduce surgeons to n = 52 + Other
+#figure out how many procedures per provider to determine 52nd highest by number as cutoff
+surgeon_case_count <- group_by(clean_data, primarysurg) %>%
+  summarize(n_procedures_per_surg = n()) %>%
+  arrange(-n_procedures_per_surg) 
+
+#set cutoff value at 52nd row (= 123)
+n_cutoff_surg <- surgeon_case_count$n_procedures_per_surg[52]
+
+clean_data_w_groupings_reduced <- clean_data_w_groupings %>%
+  inner_join(surgeon_case_count, by = "primarysurg") %>%
+  mutate(surgeon_reduced = ifelse(n_procedures_per_surg>=n_cutoff_surg, as.character(primarysurg), "Other")) %>%
+  select(-n_procedures_per_surg)
+
+```
+
+
+#RANDOM FOREST REGRESSION
+```{r  REGRESSION for provider, adjusted tabRANDOM FOREST, echo=FALSE}
+library(randomForest)
+
+clean_data_for_regression <- clean_data_w_groupings_reduced %>% mutate(
+    total_overall_MEU = total_intraop_narcotics_meu + total_pacu_narcotics_meu)
+
+#To view the data types to confirm that parameters are treated as categorical/numerical as desired:
+sapply(clean_data_for_regression, class) 
+
+#For example, in the previous step, we noticed that ASA rating was treated as numerical, but we wanted the algorithm to treat it as categorical (because this better corresponds to the I, II, III, IV ASA classification system). Thus, here we declare asarating as a factor rather than numerical integer. We also had some other categorical/binary variables listed as numbers (due to anonymization/privacy) that we wanted to convert:
+clean_data_for_regression <- transform(
+  clean_data_for_regression,
+  asarating = as.factor(asarating),
+  group_name_reduced = as.factor(group_name_reduced),
+  surgeon_reduced = as.factor(surgeon_reduced),
+  any_intraop_block = as.factor(any_intraop_block),
+  anesprovfirst = as.factor(anesprovfirst),
+  anesthesiologist_reduced = as.factor(anesthesiologist_reduced)
+)
+
+#This line of code can be used to confirm that individual variables have ≤ 53 categories:
+#n_distinct(clean_data_for_regression$anesprovfirst) #to see how many counts in each categorical variable (needs to be <= 53 for RF)
+
+#Select only relevant columns for simplicity:
+#colnames(clean_data_for_regression)
+#Including anesthesiologist_reduced for later testing (to see importance of anesthesiologist to regression)
+clean_data_for_regression <- clean_data_for_regression %>% 
+dplyr::select(anesprovfirst, anesthesiologist_reduced, anesthesiastart, caseid, service, group_name_reduced, surgeon_reduced, asarating, weight_kg, age_yrs_exact, procedure_length_hrs, any_intraop_block, total_overall_MEU)
+
+#include count NA for each category of you want to figure out where data loss is coming from
+#sapply(clean_data_for_regression, function(x) sum(is.na(x)))
+#sapply(clean_data_for_regression, function(x) sum(is.nan(x)))
+#sapply(clean_data_for_regression, function(x) sum(is.infinite(x)))
+
+
+#remove cases missing procedure length or missing ASA rating:
+clean_data_for_regression <- na.omit(clean_data_for_regression)
+
+#filter out rows with negative procedure length
+clean_data_for_regression <- dplyr::filter(clean_data_for_regression, procedure_length_hrs > 0);
+
+#final check before proceeding to regression
+#summary(clean_data_for_regression)
+
+#Separate case data into training and test sets:
+training_set_2014_to_2018 <- dplyr::filter(clean_data_for_regression, !grepl("/19 ", anesthesiastart));
+test_set_2019 <- dplyr::filter(clean_data_for_regression, grepl("/19 ", anesthesiastart));
+
+#Specifies the formula for the regression that will be fit 
+formula <- formula(total_overall_MEU ~ 1 + service + group_name_reduced + any_intraop_block + surgeon_reduced + asarating + weight_kg + age_yrs_exact + procedure_length_hrs)
+
+
+set.seed(123) #This sets a specific "random" state for the algorithm so that results are reproducible
+
+#Train random forest algorithm:
+rf <- randomForest(formula, data = training_set_2014_to_2018, importance = TRUE, ntree=1000)
+rf
+
+#To see details of the trained RF algorithm:
+which.min(rf$mse)
+plot(rf)
+
+#To plot parameter importance to RMSE reduction in the trained RF algorithm (Table S1)
+imp <- as.data.frame(sort(importance(rf)[,1],decreasing = TRUE),optional = T)
+names(imp) <- "% Inc MSE"
+imp
+
+#Create "expected" MEU predictions for cases in the 2019 test data set:
+predictions_2019 <- predict(rf, test_set_2019);
+RMSE.forest <- sqrt(mean((predictions_2019 - test_set_2019$total_overall_MEU)^2))
+RMSE.forest
+
+#Determine R2 (coefficient of determination) for the test data:
+rsq <- function (x, y) cor(x, y) ^ 2
+R2_forest <- rsq(predictions_2019, test_set_2019$total_overall_MEU)
+R2_forest
+
+#Append "expected" predictions from the algorithm to the test data set:
+test_set_2019 <- test_set_2019 %>%
+  mutate(
+    predicted_total_MEU = predictions_2019,
+    ratio_observed_to_expected = total_overall_MEU/predictions_2019,
+    residual_observed_minus_expected = total_overall_MEU - predictions_2019,
+    total_overall_MEU_per_kg = total_overall_MEU/weight_kg)
+
+#View(test_set_2019)
+
+#Merging data set fully back together:
+#clean_data_w_groupings_and_2019predictions_RF <- full_join(clean_data_w_groupings_reduced, test, by = c("caseid" = "caseid"), copy = FALSE, suffix = c(".x", ".y"))
+
+#View(clean_data_w_groupings_and_2019predictions_RF)
+
+```
+
